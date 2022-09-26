@@ -1,0 +1,539 @@
+---
+title: "GSA 2022 Abstract Code"
+author: "Peter Sun"
+date: "July 30, 2022"
+output:
+  pdf_document:
+    number_sections: true
+    toc: true
+    toc_depth: 2
+header-includes:
+- \usepackage{enumitem}
+- \usepackage{amsmath}
+- \usepackage{amssymb}
+- \usepackage{pdflscape}
+- \newcommand{\blandscape}{\begin{landscape}}
+- \newcommand{\elandscape}{\end{landscape}}
+---
+
+```{r setup, include=FALSE}
+options(scipen=999)
+knitr::opts_chunk$set(echo = TRUE)
+options(knitr.kable.NA = "") # omit NAs in Kable
+```
+
+\newpage
+# Load Packages and Data
+
+```{r message=F, error=F, warning=F}
+library(tidyverse)
+library(haven)
+library(sjlabelled)
+library(ggpubr)
+library(kableExtra)
+library(scales)
+library(choroplethr)
+library(choroplethrMaps)
+library(glue)
+library(tigris)
+data(state.regions)
+library(janitor)
+library(fips)
+library(cowplot)
+library(biscale)
+
+# Avoid select clashes
+select <- dplyr::select
+recode <- dplyr::recode
+summarize <- dplyr::summarize
+```
+
+\newpage
+# Re-Read Project-Level Environmental Variables for HRS Dataset File Paths
+
+```{r}
+readRenviron(".Renviron")
+```
+
+\newpage
+# Import Work, Age, Wave 14 (2018) Flag, and Nursing Home Status
+
+```{r}
+# Import "randhrs1992_2018v1.dta"
+rand.long <- read_dta(Sys.getenv("HRS_LONG"), 
+  col_select = c(hhid, pn, r14agey_e, inw14,
+                 r14work, # Currently Working for Pay
+                 s14hhidpn)) %>% # Spouse Identifier for Caregiving
+  rename(worker = r14work) %>%
+  haven::zap_formats() %>%
+  sjlabelled::remove_all_labels() %>%
+  as_tibble()
+
+# Inspect worker
+table(rand.long$worker, useNA = "always") # 6711 workers
+
+# Import nursing home status from "trk2018tr_r.dta"
+tracker <- read_dta(Sys.getenv("HRS_TRACKER_2018_20"),
+  col_select = c(hhid, pn, qnurshm))
+```
+
+\newpage
+# Import Geography Data
+
+```{r}
+# Import "HRSXREGION18.dta"
+geo <- read_dta(Sys.getenv("HRS_REGION_2018_82"),
+    col_select = c(hhid, pn, beale2013_18, region18)) %>%
+  rename(rural = beale2013_18) %>%
+  mutate(rural = recode(rural, 
+    `1` = "Urban",
+    `2` = "Urban",
+    `3` = "Rural",
+    .default = NA_character_)) %>%
+  mutate(region = recode(region18, 
+    `1` = "northeast", 
+    `2` = "northeast",
+    `3` = "midwest",
+    `4` = "midwest",
+    `5` = "south", 
+    `6` = "south",
+    `8` = "west",
+    `9` = "west", 
+    .default = NA_character_)) %>%
+  mutate(division = recode(region18,
+    `1` = "New England",
+    `2` = "Middle Atlantic",
+    `3` = "East North Central",
+    `4` = "West North Central",
+    `5` = "South Atlantic",
+    `6` = "East South Central",
+    `7` = "West South Central",
+    `8` = "Mountain",
+    `9` = "Pacific", .default = NA_character_)) %>%
+  haven::zap_formats() %>%
+  sjlabelled::remove_all_labels() %>%
+  as_tibble()
+```
+
+\newpage
+# Import Volunteering Data
+
+```{r}
+vol.18 <- read_dta(Sys.getenv("HRS_2018_FAT"),
+    col_select = c(hhid, pn, qg086)) %>%
+  rename(volunteer = qg086) %>%
+  mutate(volunteer = recode(volunteer,
+    `1` = 1,
+    `5` = 0, 
+    .default = NA_real_))
+table(vol.18$volunteer, useNA = "always") # 5772 volunteers
+```
+
+\newpage
+# Import Caregiving Data
+
+```{r}
+# Import 2018 RAND Fat File (File name: h04f1c.dta)
+care18 <- read_dta(Sys.getenv("HRS_2018_FAT"),
+  col_select = c(
+    "hhidpn", "hhid", "pn",
+
+    # adl helpers
+    starts_with("qg033_"),
+
+    # iadl helpers
+    starts_with("qg055_"),
+
+    # caregiving grandchildren
+    "qe060",
+
+    # caregiving parental personal
+    "qf119",
+
+    # caregiving parental errands
+    "qf139"
+  )
+) %>%
+  haven::zap_formats() %>%
+  sjlabelled::remove_all_labels() %>%
+  as_tibble()
+
+# Identify participants who had a spouse/partner ADL or IADL helper
+# QG033_x = ADL helpers
+# QG055_x = IADL helpers
+# TODO: those who did not report having ADL or IADL needs should be marked as
+# not having an ADL/IADL caregiver
+care18b <- care18 %>%
+  # Temporarily set 2s to 1, non-2 numbers to 0, and keep NAs as NAs
+  # Then count the number of 1s (which is equivalent to the number of 2s)
+  mutate(spouse_helper_sum = rowSums(
+    ifelse(select(., starts_with("qg033"), starts_with("qg055")) == 2, 1, 0),
+    na.rm = T
+  )) %>%
+  
+  # Because rowSums in the above syntax will count all NAs as 0, 
+  # use !is.na(...) == 0 to set all
+  # non-missing values to TRUE and missing values to FALSE
+  # Then use rowSums to count the number of non-missing values
+  # Because FALSE = missing, if all of the columns are FALSE/NA/Missing, 
+  # then the sum will be 0
+  # Finally, set spouse_helper_sum to NA_real_ if all of the columns are False/NA/Missing
+  mutate(spouse_helper_sum = ifelse(
+    rowSums(!is.na(select(., starts_with("qg033"), starts_with("qg055")))) == 0, 
+    NA_real_, spouse_helper_sum
+  )) %>%
+  
+  # spouse_helper_sum counts the number of 2s (spouse/partner) in QG033_x and QG055_x
+  # has_spouse_helper coding:
+  # 1 = if there is at least one 2s across all QG033_x and QG055_x variables
+  # 0 = if there is at least one non-missing variable and no 2s
+  # NA = all QG033_x and QG055_x variables are NAs
+  mutate(has_spouse_helper = ifelse(spouse_helper_sum >= 1, 1, 
+                             ifelse(is.na(spouse_helper_sum), NA_real_, 0)))
+table(care18b$has_spouse_helper, useNA = "always")
+
+# Extract participants who have a spousal ADL/IADL caregiver
+# Merge their spouse PN
+# Then create a dataset with hhid and pn of spouse and an indication of
+# whether or not they are a spousal caregiver
+spousal_caregivers.18 <- care18b %>%
+  filter(has_spouse_helper == 1) %>%
+  select(hhid, pn, has_spouse_helper) %>%
+  
+  # Left join with respondents' spouse/partner's hhidpn in wave 14 (2018)
+  # "If there is no spouse in a given wave, SwHHIDPN is set to zero. If SwHHIDPN is 
+  # unknown, and the marital status in a particular wave
+  # is either missing (.M) or married, SwHHIDPN is set to a special missing code of .M."
+  left_join(rand.long %>% select(hhid, pn, s14hhidpn) %>% 
+              filter(!is.na(s14hhidpn), s14hhidpn != 0, !is.na(hhid), !is.na(pn)),
+    by = c("hhid", "pn")
+  ) %>%
+  select(hhidpn = s14hhidpn, caregiver_spousal = has_spouse_helper)
+spousal_caregivers.18
+table(is.na(spousal_caregivers.18$hhidpn), useNA = "always") # 27 spouses not in dataset
+
+# Merge the spousal_caregivers data back to the dataset
+care18c <- care18b %>%
+  left_join(spousal_caregivers.18, by = c("hhidpn"))
+
+# Format parental/grandchildren caregivers
+# qe060 = grandchildren caregiver
+# qf119 = parental caregiver (personal needs) (1 = yes, 5 = no, 8 = DK, 9 = RF)
+# qf139 = parental caregiver (errands)
+care18d <- care18c %>%
+  mutate(across(
+    .cols = c(qe060, qf119, qf139),
+    ~ recode(.,
+      `1` = 1, `5` = 0, `8` = NA_real_, `9` = NA_real_,
+      .default = NA_real_
+    )
+  )) %>%
+  rename(
+    caregiver_grandchildren = qe060,
+    caregiver_parental_personal = qf119,
+    caregiver_parental_errands = qf139
+  ) %>%
+  mutate(
+    caregiver_parental =
+      ifelse(caregiver_parental_personal == 1 | caregiver_parental_errands == 1, 1, 
+      ifelse(is.na(caregiver_parental_personal) & is.na(caregiver_parental_errands), 
+             NA_real_, 0)))
+table(care18d$caregiver_parental, useNA = "always")
+
+# Caregiver Coding
+# 1 = If at least one type of caregiver
+# NA = Two or more NAs
+# 0 = All other cases (at least two zeroes)
+care18e <- care18d %>%
+  select(hhid, pn,
+    cs = caregiver_spousal,
+    cp = caregiver_parental,
+    cg = caregiver_grandchildren
+  ) %>%
+  mutate(
+    Caregiver_Sum = rowSums(select(., cs:cg), na.rm = T),
+    # Set caregiver to NA if two or more NAs
+    Caregiver_NACount = rowSums(is.na(select(., cs:cg))),
+    Caregiver_Sum = ifelse(Caregiver_NACount >= 2, NA_real_, Caregiver_Sum),
+    caregiver = ifelse(Caregiver_Sum >= 1, 1, 
+                ifelse(is.na(Caregiver_Sum), NA_real_, 0))
+  ) %>%
+  select(hhid, pn, caregiver)
+table(care18e$caregiver, useNA = "always") # 2640 caregivers
+```
+
+\newpage
+# Merge Datasets and Create Multiple Productive Activities
+
+```{r}
+df <- rand.long %>%
+  left_join(tracker, by = c("hhid", "pn")) %>%
+  filter(inw14 == 1) %>% # in wave 14
+  filter(qnurshm %in% c(5, 6, 7)) %>% # community-dwelling
+  filter(r14agey_e >= 65) %>% # age 65+
+  left_join(geo, by = c("hhid", "pn")) %>%
+  left_join(vol.18, by = c("hhid", "pn")) %>%
+  left_join(care18e, by = c("hhid", "pn")) %>%
+  
+  # Count 0s and 1s
+  mutate(multi_zeroes = rowSums(select(., volunteer, caregiver, worker) == 0, 
+                                na.rm = T)) %>%
+  mutate(multi_ones = rowSums(select(., volunteer, caregiver, worker) == 1, 
+                              na.rm = T)) %>%
+  
+  # Set multi to 0 if at least one 0, otherwise NA
+  mutate(multi = ifelse(multi_zeroes >= 1, 0, NA_real_)) %>%
+  
+  # Set multi to 1 if at least one productive activity
+  mutate(multi = ifelse(multi_ones >= 1, 1, multi))
+  # rowwise() %>%
+  # mutate(multi_sum = sum(c_across(c(volunteer, caregiver, worker)), na.rm = T)) %>%
+  # ungroup()
+
+table(df$volunteer, useNA = "always")
+table(df$caregiver, useNA = "always") # likely an underestimation of non-caregivers
+table(df$worker, useNA = "always")  
+table(df$multi, useNA = "always")
+#df %>% select(volunteer, caregiver, worker, multi_zeroes, multi_ones, multi) %>% view()
+```
+
+## Study Sample Size
+
+```{r}
+study_n <- nrow(df)
+study_n # 2018 HRS sample of age 65+ community-dwelling individuals
+```
+
+\newpage
+# Helper Functions
+
+```{r}
+# Function for contingency table
+# The denominator is currently assumed to be the sum of 0s and NAs, that is,
+# the total population in each region/division. This is a 
+# limitation in this current study, because of the possibility of non-response bias.
+get_kab <- function(data, geo, iv) {
+  data %>%
+    count({{ geo }}, rural, {{ iv }}) %>%
+    group_by({{ geo }}, rural) %>%
+    mutate(denom = sum(n),
+           pct = n / denom) %>%
+    ungroup() %>%
+    filter({{ iv }} == 1) %>%
+    filter(!is.na({{ geo }}), !is.na(rural), !is.na({{ iv }})) %>%
+    select(-{{ iv }})
+}
+
+# Function for two proportion z-test
+get_prop <- function(data, geo, iv) {
+  data %>%
+    count({{ geo }}, rural, {{ iv }}) %>%
+    group_by({{ geo }}, rural) %>%
+    mutate(sum = sum(n)) %>%
+    ungroup() %>%
+    filter({{ iv }} == 1) %>%
+    filter(!is.na({{ geo }}), !is.na(rural), !is.na({{ iv }})) %>%
+    pivot_wider(names_from = "rural", values_from = n:sum) %>%
+    rowwise() %>%
+    mutate(p = prop.test(x = c(n_Rural, n_Urban), 
+                         n = c(sum_Rural, sum_Urban))$p.value,
+           rural_prop = prop.test(x = c(n_Rural, n_Urban), 
+                                  n = c(sum_Rural, sum_Urban))$estimate[1],
+           urban_prop = prop.test(x = c(n_Rural, n_Urban), 
+                                  n = c(sum_Rural, sum_Urban))$estimate[2]) %>%
+    mutate(rural_prop = percent(rural_prop, accuracy = .1),
+           urban_prop = percent(urban_prop, accuracy = .1)) %>%
+    kbl(booktabs = T, linesep = "", digits = 3) %>%
+    kable_styling(position = "center") %>%
+    kable_styling(latex_options = c("striped", "hold_position")) 
+}
+```
+
+\newpage
+# Results
+
+## Census Region Statistics
+
+```{r}
+r1 <- get_kab(df, region, worker) %>% rename(worker = pct)
+r2 <- get_kab(df, region, volunteer) %>% rename(volunteer = pct)
+r3 <- get_kab(df, region, caregiver) %>% rename(caregiver = pct)
+r4 <- get_kab(df, region, multi) %>% rename(multiple = pct)
+r1 %>%
+  left_join(r2, by = c("region", "rural")) %>%
+  left_join(r3, by = c("region", "rural")) %>%
+  left_join(r4, by = c("region", "rural")) %>%
+  select(-starts_with("n"), -starts_with("denom")) %>%
+  mutate(across(where(is.numeric), scales::percent, 0.1)) %>%
+  kbl(booktabs = T, linesep = "") %>%
+  kable_styling(position = "center") %>%
+  kable_styling(latex_options = c("striped", "hold_position"))  
+```
+
+\newpage
+## Census Division Statistics
+
+```{r}
+d1 <- get_kab(df, division, worker) %>% rename(worker = pct)
+d2 <- get_kab(df, division, volunteer) %>% rename(volunteer = pct)
+d3 <- get_kab(df, division, caregiver) %>% rename(caregiver = pct)
+d4 <- get_kab(df, division, multi) %>% rename(multiple = pct)
+d1 %>%
+  left_join(d2, by = c("division", "rural")) %>%
+  left_join(d3, by = c("division", "rural")) %>%
+  left_join(d4, by = c("division", "rural")) %>%
+  select(-starts_with("n"), -starts_with("denom")) %>%
+  mutate(across(where(is.numeric), scales::percent, 0.1)) %>%
+  kbl(booktabs = T, linesep = "") %>%
+  kable_styling(position = "center") %>%
+  kable_styling(latex_options = c("striped", "hold_position"))  
+```
+
+\newpage
+## Rural-Urban Comparisons (Two-Proportion Z Tests)
+
+### Region: Worker, Volunteer, Caregiver, and Multiple
+
+```{r}
+get_prop(df, region, worker)
+get_prop(df, region, volunteer)
+get_prop(df, region, caregiver)
+get_prop(df, region, multi)
+```
+
+\blandscape
+
+\newpage
+### Division: Worker and Volunteer
+
+```{r}
+get_prop(df, division, worker)
+get_prop(df, division, volunteer)
+```
+
+\newpage
+### Division: Caregiver and Multiple
+
+```{r error=F, warning=F, message=F}
+get_prop(df, division, caregiver)
+get_prop(df, division, multi)
+```
+
+\elandscape
+
+\newpage
+# Plots
+
+```{r}
+# Obtain a list of states and FIPS codes
+fp <- tidycensus::fips_codes %>%
+  as_tibble() %>%
+  group_by(state) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(state_code = state, GEOID = state_code) %>%
+  arrange(GEOID)
+
+# Join FIPS codes with Census divisions
+rd <- read_csv("private/poster/us_census_regions_and_divisions.csv") %>%
+  janitor::clean_names() %>%
+  left_join(fp, by = "state_code") %>%
+  arrange(GEOID) %>%
+  select(GEOID, division)
+
+# Get list of states per division
+read_csv("private/poster/us_census_regions_and_divisions.csv") %>%
+  janitor::clean_names() %>%
+  left_join(fp, by = "state_code") %>%
+  group_by(division) %>%
+  summarize(states = paste0(state_code, collapse = ", "))
+
+# Get proportions of older adults with at least one productive activity by division
+multi <- get_kab(df, division, multi) %>%
+  select(-n, -denom) %>%
+  pivot_wider(names_from = "rural", values_from = "pct")
+multi
+
+# Join data with FIPS/divisions
+rd_multi <- rd %>%
+  left_join(multi, by = "division")
+
+# Download a states map (filter out Puerto Rico)
+# Transform to USA Contiguous Albers Equal Area Conic ('ESRI:102003')
+states_tmp <- tigris::states(class = "sf", resolution = "20m", cb = T) %>%
+  filter(GEOID != "72") %>% # filter out Puerto Rico (PR)
+  shift_geometry()
+
+# Merge sf map with data
+states <- states_tmp %>%
+  left_join(rd_multi, by = "GEOID")
+
+# Function to produce a bivariate choropleth map
+gen_map <- function(mypal) {
+  mydim <- 3
+  mystyle <- "quantile"
+  data <- bi_class(states, x = Rural, y = Urban, style = mystyle, dim = mydim)
+  breaks <- bi_class_breaks(states, x = Rural, y = Urban, style = mystyle, dim = mydim)
+  map <- ggplot() +
+    geom_sf(
+      data = data, mapping = aes(fill = bi_class), show.legend = FALSE,
+      color = "gray65", size = 0.5
+    ) +
+    bi_scale_fill(pal = mypal, dim = mydim) +
+    # geom_sf_label(data = data, aes(label = NAME)) +
+    bi_theme(bg_color = "transparent") +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "transparent", colour = NA),
+      plot.background = element_rect(fill = "transparent", colour = NA),
+      plot.title = element_text(color = "gray80", size = 30, face = "bold"),
+      legend.background = element_rect(fill = "transparent", color = NA),
+      legend.position = "bottom",
+      plot.margin = margin(0, 200, 0, 0, "pt") # top, right, bottom, left
+    )
+  default_background_color <- "transparent"
+  legend <- bi_legend(
+    pal = mypal,
+    dim = mydim,
+    xlab = "Higher % PE in Rural",
+    ylab = "Higher % PE in Urban",
+    size = 12
+  ) +
+    theme(
+      plot.background = element_rect(
+        fill = default_background_color,
+        color = NA
+      ),
+      panel.background = element_rect(
+        fill = default_background_color,
+        color = NA
+      ),
+      legend.background = element_rect(
+        fill = default_background_color,
+        color = NA
+      ),
+      text = element_text(color = "white")
+    )
+  finalPlot <- ggdraw() +
+    draw_plot(map, 0, 0, 1, 1) +
+    draw_plot(legend, 0.6, .1, 0.35, 0.35)
+  finalPlot
+}
+
+# Produce map based on given bivariate color scheme
+# pals <- c("Bluegill", "BlueGold", "BlueOr", "BlueYl", "Brown", "Brown2",
+# "DkBlue", "DkBlue2", "DkCyan", "DkCyan2", "DkViolet", "DkViolet2", "GrPink",
+# "GrPink2", "PinkGrn", "PurpleGrn", "PurpleOr")
+pals <- "DkBlue"
+for (p in pals) {
+  # mypal <- "DkBlue2"
+  mymap <- gen_map(p)
+  print(mymap)
+  map_filename <- glue("map_{p}.png")
+  ggsave(map_filename,
+    plot = mymap, width = 12, height = 7, dpi = 600,
+    bg = "transparent"
+  )
+}
+```
